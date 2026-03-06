@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Operator's VR Pawn Explorer</title>
+  <!-- A-Frame 1.5.0 is required for stable WebXR hand tracking on Quest 3 -->
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <!-- Environment component -->
+  <script src="https://unpkg.com/aframe-environment-component@1.3.3/dist/aframe-environment-component.min.js"></script>
+  <script>
+    // Component to make platforms and objects float up and down
+    AFRAME.registerComponent('oscillate', {
+      schema: {
+        speed: {type: 'number', default: 1},
+        amount: {type: 'number', default: 0.5},
+        offset: {type: 'number', default: 0}
+      },
+      init: function() { 
+        this.baseY = this.el.object3D.position.y; 
+      },
+      tick: function(time) {
+        this.el.object3D.position.y = this.baseY + Math.sin(time / 1000 * this.data.speed + this.data.offset) * this.data.amount;
+      }
+    });
+
+    // Operator's Direct Neural Link (VR Pawn Hand Locomotion)
+    AFRAME.registerComponent('pawn-locomotion', {
+      schema: {
+        rig: { type: 'selector', default: '#rig' },
+        head: { type: 'selector', default: '#head' },
+        hudState: { type: 'selector', default: '#hud-state' },
+        hudSpd: { type: 'selector', default: '#hud-spd' }
+      },
+
+      init: function () {
+        // State machine: IDLE -> READY -> EXPLORING
+        this.state = 'IDLE';
+        
+        // Physics and tracking vectors
+        this.velocity = new THREE.Vector3(0, 0, 0);
+        this.anchorRight = new THREE.Vector3();
+        
+        // Camera direction vectors for head-relative movement
+        this.cameraForward = new THREE.Vector3();
+        this.cameraRight = new THREE.Vector3();
+
+        this.updateHUD('IDLE\nMake right fist to engage');
+      },
+
+      updateHUD: function(text) {
+        if (this.data.hudState) {
+          this.data.hudState.setAttribute('value', text);
+          
+          if(this.state === 'IDLE') this.data.hudState.setAttribute('color', '#ff3333');
+          if(this.state === 'READY') this.data.hudState.setAttribute('color', '#ffaa00');
+          if(this.state === 'EXPLORING') this.data.hudState.setAttribute('color', '#00ffff');
+        }
+      },
+
+      tick: function (time, timeDelta) {
+        const dt = timeDelta / 1000; 
+        if (dt === 0) return;
+
+        const sceneEl = this.el.sceneEl;
+        if (!sceneEl.is('vr-mode')) return; 
+
+        const frame = sceneEl.frame;
+        const renderer = sceneEl.renderer;
+        if (!frame || !renderer.xr.getSession()) return;
+
+        const session = renderer.xr.getSession();
+        const refSpace = renderer.xr.getReferenceSpace();
+
+        // Locate right hand source
+        let rightHandSource = null;
+        for (let source of session.inputSources) {
+          if (source.hand && source.handedness === 'right') {
+            rightHandSource = source;
+            break;
+          }
+        }
+
+        let trackingLost = true;
+        let rightWristPose, indexPose, pinkyPose;
+
+        if (rightHandSource) {
+          rightWristPose = frame.getJointPose(rightHandSource.hand.get('wrist'), refSpace);
+          indexPose = frame.getJointPose(rightHandSource.hand.get('index-finger-tip'), refSpace);
+          pinkyPose = frame.getJointPose(rightHandSource.hand.get('pinky-finger-tip'), refSpace);
+          
+          if (rightWristPose && indexPose && pinkyPose) {
+            trackingLost = false;
+          }
+        }
+
+        if (trackingLost) {
+          if (this.state === 'EXPLORING') {
+             this.state = 'IDLE';
+             this.updateHUD('TRACKING LOST\nMake fist to resume');
+          }
+        } else {
+          // --- GESTURE RECOGNITION (FIST MATH) ---
+          const dxI = rightWristPose.transform.position.x - indexPose.transform.position.x;
+          const dyI = rightWristPose.transform.position.y - indexPose.transform.position.y;
+          const dzI = rightWristPose.transform.position.z - indexPose.transform.position.z;
+          const distIndex = Math.sqrt(dxI*dxI + dyI*dyI + dzI*dzI);
+
+          const dxP = rightWristPose.transform.position.x - pinkyPose.transform.position.x;
+          const dyP = rightWristPose.transform.position.y - pinkyPose.transform.position.y;
+          const dzP = rightWristPose.transform.position.z - pinkyPose.transform.position.z;
+          const distPinky = Math.sqrt(dxP*dxP + dyP*dyP + dzP*dzP);
+
+          const isFist = distIndex < 0.11 && distPinky < 0.11;
+          const isOpen = distIndex > 0.15 && distPinky > 0.15;
+
+          // --- STATE MACHINE ---
+          if (this.state === 'IDLE' && isFist) {
+            this.state = 'READY';
+            this.updateHUD('READY\nOpen hand to lock anchor');
+          } else if (this.state === 'READY' && isOpen) {
+            this.state = 'EXPLORING';
+            // SET ANCHOR! We read the position the moment the hand opens.
+            this.anchorRight.copy(rightWristPose.transform.position);
+            this.updateHUD('EXPLORING\nPush from anchor to move');
+          } else if (this.state === 'EXPLORING' && isFist) {
+            this.state = 'IDLE'; 
+            this.updateHUD('BRAKING\nMake fist to engage');
+          }
+
+          // --- LOCOMOTION KINEMATICS ---
+          if (this.state === 'EXPLORING') {
+            let curRight = rightWristPose.transform.position;
+
+            // Calculate positional delta from the invisible anchor point
+            let dZ = curRight.z - this.anchorRight.z; // Push forward is negative Z
+            let dX = curRight.x - this.anchorRight.x; // Right is positive X
+            let dY = curRight.y - this.anchorRight.y; // Up is positive Y (Using Y as thrust now)
+
+            const posDeadzone = 0.04; // 4cm deadzone around anchor
+            const posSensitivity = 10.0; // Multiplier: hand distance -> movement speed
+
+            // Apply deadzones to eliminate micro-jitters
+            let tz = Math.abs(dZ) > posDeadzone ? dZ + (dZ > 0 ? -posDeadzone : posDeadzone) : 0;
+            let tx = Math.abs(dX) > posDeadzone ? dX + (dX > 0 ? -posDeadzone : posDeadzone) : 0;
+            let ty = Math.abs(dY) > posDeadzone ? dY + (dY > 0 ? -posDeadzone : posDeadzone) : 0;
+
+            // Extract Camera's current facing directions
+            const headObj = this.data.head.object3D;
+            
+            // Forward vector relative to where you are looking
+            this.cameraForward.set(0, 0, -1).applyQuaternion(headObj.quaternion);
+            // Right vector relative to where you are looking
+            this.cameraRight.set(1, 0, 0).applyQuaternion(headObj.quaternion);
+
+            // Calculate target velocity based on head orientation
+            let targetVel = new THREE.Vector3();
+            
+            // Pushing hand forward (negative Z delta) moves you FORWARD
+            targetVel.addScaledVector(this.cameraForward, -tz * posSensitivity);
+            // Pushing hand right (positive X delta) moves you RIGHT
+            targetVel.addScaledVector(this.cameraRight, tx * posSensitivity);
+            // Pushing hand up/down moves you strictly vertically globally (optional 'elevation' control)
+            targetVel.y += ty * posSensitivity;
+
+            // Clamp max speed
+            const maxSpeed = 8.0; 
+            if (targetVel.length() > maxSpeed) {
+              targetVel.normalize().multiplyScalar(maxSpeed);
+            }
+
+            // Smooth interpolation for acceleration
+            const lerpFactor = 4.0 * dt; 
+            this.velocity.lerp(targetVel, lerpFactor);
+          }
+        }
+
+        // Apply friction/braking if not moving
+        if (this.state !== 'EXPLORING') {
+          this.velocity.multiplyScalar(0.9);
+        }
+
+        // Apply velocity to the Rig
+        this.data.rig.object3D.position.x += this.velocity.x * dt;
+        this.data.rig.object3D.position.y += this.velocity.y * dt;
+        this.data.rig.object3D.position.z += this.velocity.z * dt;
+
+        // Hard floor collision so you don't clip through the void
+        if (this.data.rig.object3D.position.y < 0) {
+          this.data.rig.object3D.position.y = 0;
+          if (this.velocity.y < 0) this.velocity.y = 0;
+        }
+
+        // --- TELEMETRY DATA PUSH TO HUD ---
+        if (this.data.hudSpd) {
+          let spdStr = this.velocity.length().toFixed(1);
+          this.data.hudSpd.setAttribute('value', SPD\n${spdStr}m/s);
+        }
+      }
+    });
+  </script>
+</head>
+<body>
+  <a-scene webxr="optionalFeatures: hand-tracking;" pawn-locomotion background="color: #000000">
+    
+    <!-- Environment -->
+    <a-entity environment="preset: contact; groundColor: #112; grid: 1x1; dressingAmount: 60"></a-entity>
+
+    <!-- ABSTRACT FLOATING GEOMETRY GARDEN -->
+    <!-- Platform 1: Central Hub -->
+    <a-entity position="0 4 -12" oscillate="speed: 1.2; amount: 0.8; offset: 0">
+      <a-cylinder segments-radial="6" radius="4" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="4.1" height="0.45" color="#00ffff" wireframe="true"></a-cylinder>
+      <a-icosahedron color="#ff00ff" wireframe="true" radius="1.2" position="0 2 0" animation="property: rotation; to: 0 360 0; loop: true; dur: 8000; easing: linear"></a-icosahedron>
+      <a-octahedron color="#00ffff" opacity="0.5" radius="0.5" position="0 2 0" animation="property: rotation; to: 360 0 360; loop: true; dur: 4000; easing: linear"></a-octahedron>
+    </a-entity>
+
+    <!-- Platform 2: High Right -->
+    <a-entity position="12 8 -25" oscillate="speed: 0.8; amount: 1.5; offset: 2.5">
+      <a-cylinder segments-radial="6" radius="3" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="3.1" height="0.45" color="#00ffaa" wireframe="true"></a-cylinder>
+      <a-cone radius-bottom="0.8" radius-top="0" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 1 0"></a-cone>
+      <a-cone radius-bottom="0" radius-top="0.8" segments-radial="4" height="2" color="#00ffaa" wireframe="true" position="0 3 0"></a-cone>
+    </a-entity>
+
+    <!-- Platform 3: Low Left -->
+    <a-entity position="-15 5 -20" oscillate="speed: 1.5; amount: 0.6; offset: 1.2">
+      <a-cylinder segments-radial="6" radius="5" height="0.4" color="#111" wireframe="false"></a-cylinder>
+      <a-cylinder segments-radial="6" radius="5.1" height="0.45" color="#ff00ff" wireframe="true"></a-cylinder>
+      <a-dodecahedron color="#ff00ff" wireframe="true" radius="1.5" position="0 1.5 0" animation="property: rotation; to: -360 360 0; loop: true; dur: 12000; easing: linear"></a-dodecahedron>
+      <a-dodecahedron color="#00ffff" wireframe="true" radius="0.8" position="2 1 2" animation="property: rotation; to: 0 360 360; loop: true; dur: 6000; easing: linear"></a-dodecahedron>
+      <a-dodecahedron color="#00ffaa" wireframe="true" radius="1.0" position="-2 2 -1" animation="property: rotation; to: 360 0 -360; loop: true; dur: 9000; easing: linear"></a-dodecahedron>
+    </a-entity>
+
+    <!-- Angular Training Rings -->
+    <a-entity id="training-course">
+      <a-torus position="0 1.5 -6" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
+      <a-torus position="0 2.5 -16" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 0 0" opacity="0.8"></a-torus>
+      <a-torus position="3 2.0 -24" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 30 0" opacity="0.8"></a-torus>
+      <a-torus position="8 1.5 -30" radius="1.2" tube="0.05" color="#00ffaa" rotation="0 60 0" opacity="0.8"></a-torus>
+    </a-entity>
+
+    <!-- Player Rig -->
+    <a-entity id="rig" position="0 0 0">
+      
+      <!-- Camera / Head -->
+      <a-camera id="head" position="0 1.6 0">
+        
+        <!-- Clean Tactical HUD -->
+        <a-entity id="iron-man-hud" position="0 0 -0.8">
+          
+          <!-- Center Reticle -->
+          <a-ring color="#00ffff" radius-inner="0.03" radius-outer="0.035" opacity="0.6"></a-ring>
+          <a-circle color="#ff3333" radius="0.003" opacity="0.8"></a-circle>
+
+          <!-- Framing Lines -->
+          <a-entity line="start: -0.4 0.3 0; end: 0.4 0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
+          <a-entity line="start: -0.4 -0.3 0; end: 0.4 -0.3 0; color: #00ffff; opacity: 0.3"></a-entity>
+
+          <!-- Left: Speed -->
+          <a-text id="hud-spd" 
+                  position="-0.45 0 0" 
+                  value="SPD\n0.0m/s" 
+                  align="center" 
+                  width="1.2" 
+                  color="#00ffff" 
+                  font="monoid"
+                  opacity="0.9">
+          </a-text>
+
+          <!-- Bottom: State Warnings -->
+          <a-text id="hud-state" 
+                  position="0 -0.35 0" 
+                  value="INITIALIZING..." 
+                  align="center" 
+                  width="0.9" 
+                  color="#ff3333" 
+                  font="monoid">
+          </a-text>
+
+        </a-entity>
+      </a-camera>
+
+      <!-- Hand Models -->
+      <a-entity id="leftHand" hand-tracking-controls="hand: left; modelColor: #00ffff;"></a-entity>
+      <a-entity id="rightHand" hand-tracking-controls="hand: right; modelColor: #00ffff;"></a-entity>
+
+    </a-entity>
+
+  </a-scene>
+</body>
+</html>
